@@ -1,294 +1,474 @@
 #!/usr/bin/env bash
-# git-timesheet — summarise your commits as a daily timesheet (Excel output)
-# Usage: git-timesheet [author_email] [days_ago]
-
+# ─────────────────────────────────────────────────────────────────────────────
+# gitlogger v2.0  —  multi-author, multi-format git timesheet
+#
+# IMPROVEMENTS over v1:
+#   --dir         target any repo path, not just cwd
+#   --author      repeat flag for multiple emails; shows per-author tags
+#   --format      terminal | json | csv | md
+#   --group-by    day | type  (conventional commit grouping)
+#   --merges      opt-in to include merge commits
+#   Portability   no grep -P (not on macOS), works on Linux + macOS
+#   Performance   single git log call; awk-based message parsing
+#                 replaces 6 subshells-per-commit with one awk stream
+#   Safety        division-by-zero guard; positive-int day validation
+#   Modular       each concern is its own function
+# ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-AUTHOR="${1:-$(git config user.email 2>/dev/null || echo "")}"
-DAYS="${2:-15}"
-SINCE="${DAYS} days ago"
-
-OUTPUT_DIR="$PWD"
-OUTPUT_FILE="${OUTPUT_DIR}/git-timesheet-$(date +%Y-%m-%d).xlsx"
-
-if [ -t 1 ]; then
-  BOLD="\033[1m"; CYAN="\033[36m"; GREEN="\033[32m"
-  YELLOW="\033[33m"; GREY="\033[90m"; RESET="\033[0m"
-else
-  BOLD=""; CYAN=""; GREEN=""; YELLOW=""; GREY=""; RESET=""
-fi
-
-if [ -z "$AUTHOR" ]; then
-  echo "Usage: git-timesheet <author_email> [days_ago]"
-  echo "  or set user.email in git config and run without arguments."
+# ── Bash 4+ required (for associative arrays, mapfile) ────────────────────────
+if (( BASH_VERSINFO[0] < 4 )); then
+  printf 'Error: gitlogger requires bash 4.0+ (current: %s)\n' "$BASH_VERSION" >&2
+  printf 'macOS: brew install bash && hash -r\n' >&2
   exit 1
 fi
 
-if ! git rev-parse --is-inside-work-tree &>/dev/null; then
-  echo -e "${BOLD}✗ Error:${RESET} You are not inside a git repository."
-  exit 1
-fi
+readonly VERSION="2.0.0"
 
-REPO_ROOT=$(git rev-parse --show-toplevel)
-REPO_NAME=$(basename "$REPO_ROOT")
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
-REMOTE_URL=$(git remote get-url origin 2>/dev/null || echo "no remote")
-BRANCH_COUNT=$(git branch --all 2>/dev/null | wc -l | tr -d ' ')
+# ── Defaults ──────────────────────────────────────────────────────────────────
+AUTHORS=()
+DAYS=15
+DIR="."
+FORMAT="terminal"    # terminal | json | csv | md
+GROUP_BY="day"       # day | type
+INCLUDE_MERGES=false
+SHOW_STATS=true
+SKIP_CONFIRM=false
 
-echo ""
-echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────────┐${RESET}"
-echo -e "${BOLD}${CYAN}  │           Repository Detected                │${RESET}"
-echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────────┘${RESET}"
-echo -e "  ${GREY}Name     :${RESET} ${BOLD}${REPO_NAME}${RESET}"
-echo -e "  ${GREY}Path     :${RESET} ${REPO_ROOT}"
-echo -e "  ${GREY}Branch   :${RESET} ${CURRENT_BRANCH}"
-echo -e "  ${GREY}Remote   :${RESET} ${REMOTE_URL}"
-echo -e "  ${GREY}Branches :${RESET} ${BRANCH_COUNT} (local + remote)"
-echo -e "  ${GREY}Author   :${RESET} ${AUTHOR}"
-echo -e "  ${GREY}Period   :${RESET} last ${DAYS} days"
-echo -e "  ${GREY}Output   :${RESET} ${OUTPUT_FILE}"
-echo ""
-
-printf "  Analyse this repo? [y/N] "
-read -r CONFIRM < /dev/tty
-
-case "$CONFIRM" in
-  [yY][eE][sS]|[yY]) ;;
-  *)
-    echo -e "\n  ${YELLOW}Aborted.${RESET}\n"
-    exit 0
-    ;;
-esac
-echo ""
-
-clean_message() {
-  echo "$1" \
-    | sed -E 's/^\[?[A-Z]+-[0-9]+\]?[[:space:]:/-]*//' \
-    | sed -E 's/^#[0-9]+[[:space:]]*//' \
-    | sed -E 's/^(feat|fix|chore|docs|style|refactor|test|build|ci|perf|revert)(\([^)]*\))?[[:space:]]*:[[:space:]]*//' \
-    | sed -E 's/^(Merge (branch|pull request|remote-tracking branch)[^$]*)/[merge] \1/' \
-    | sed -E 's/[[:space:]]+/ /g' \
-    | sed -E 's/^[[:space:]]+|[[:space:]]+$//' \
-    | awk '{ $1=toupper(substr($1,1,1)) substr($1,2); print }'
+# ── Colors ────────────────────────────────────────────────────────────────────
+B="" C="" Gr="" Y="" Gy="" Rs=""
+init_colors() {
+  # Colors only when writing to a terminal in terminal format
+  [[ "$FORMAT" == "terminal" && -t 1 ]] || return 0
+  B=$'\033[1m' C=$'\033[36m' Gr=$'\033[32m' Y=$'\033[33m' Gy=$'\033[90m' Rs=$'\033[0m'
 }
 
-RAW_LOG=$(git log --all \
-  --author="$AUTHOR" \
-  --since="$SINCE" \
-  --pretty=format:"DATE:%ad|HASH:%h|MSG:%s" \
-  --date=short \
-  --no-merges 2>/dev/null || true)
+# ── Conventional commit type → display label ──────────────────────────────────
+declare -A TYPE_LABELS=(
+  [feat]="✨ Features"        [fix]="🐛 Bug Fixes"
+  [docs]="📝 Documentation"   [refactor]="♻️  Refactor"
+  [test]="🧪 Tests"           [chore]="🔧 Chore"
+  [style]="💅 Style"          [perf]="⚡ Performance"
+  [ci]="🏗️  CI / Build"       [build]="🏗️  CI / Build"
+  [revert]="⏪ Reverts"        [other]="📌 Other"
+)
 
-MERGE_COUNT=$(git log --all \
-  --author="$AUTHOR" \
-  --since="$SINCE" \
-  --merges \
-  --oneline 2>/dev/null | wc -l | tr -d ' ')
+# ── Usage ─────────────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+gitlogger v${VERSION} — git commit timesheet
 
-if [ -z "$RAW_LOG" ]; then
-  echo -e "${YELLOW}No commits found for ${AUTHOR} in the last ${DAYS} days.${RESET}"
-  exit 0
-fi
+Usage: gitlogger [OPTIONS]
 
-TOTAL_COMMITS=$(echo "$RAW_LOG" | wc -l | tr -d ' ')
-FIRST_DATE=$(echo "$RAW_LOG" | tail -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
-LAST_DATE=$(echo "$RAW_LOG"  | head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
-ACTIVE_DAYS=$(echo "$RAW_LOG" | grep -oP '(?<=DATE:)[^\|]+' | sort -u | wc -l | tr -d ' ')
+  -a, --author <email>    Author email (repeat for multiple authors)
+  -d, --dir <path>        Repo path (default: current directory)
+  -n, --days <N>          Days to look back (default: 15)
+  -f, --format <fmt>      terminal | json | csv | md  (default: terminal)
+  -g, --group-by <by>     day | type  (default: day)
+  -m, --merges            Include merge commits (default: excluded)
+  -y, --yes               Skip confirmation prompt
+      --no-stats          Hide summary footer
+  -v, --version           Print version
+  -h, --help              Show this help
 
-# Write commits to a temp CSV — avoids all heredoc/stdin conflicts
-TMPCSV=$(mktemp /tmp/gt-XXXXXX.csv)
-TMPPY=$(mktemp /tmp/gt-XXXXXX.py)
-trap 'rm -f "$TMPCSV" "$TMPPY"' EXIT
+Examples:
+  gitlogger -a me@example.com -n 7
+  gitlogger -a alice@co.com -a bob@co.com -n 30 --format md > sprint.md
+  gitlogger -d ~/projects/api --group-by type
+  gitlogger --format json | jq '.commits | length'
+  gitlogger --format csv | sort -t, -k1
+EOF
+}
 
-while IFS= read -r line; do
-  DATE=$(echo "$line" | grep -oP '(?<=DATE:)[^\|]+')
-  HASH=$(echo "$line" | grep -oP '(?<=HASH:)[^\|]+')
-  MSG=$(echo "$line"  | grep -oP '(?<=MSG:).+')
-  TASK=$(clean_message "$MSG")
-  TASK_ESC=$(echo "$TASK" | sed 's/"/""/g')
-  printf '%s,%s,"%s"\n' "$DATE" "$HASH" "$TASK_ESC" >> "$TMPCSV"
-done <<< "$RAW_LOG"
+# ── Argument parsing ──────────────────────────────────────────────────────────
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--author)   AUTHORS+=("$2");      shift 2 ;;
+      -d|--dir)      DIR="$2";             shift 2 ;;
+      -n|--days)     DAYS="$2";            shift 2 ;;
+      -f|--format)   FORMAT="$2";          shift 2 ;;
+      -g|--group-by) GROUP_BY="$2";        shift 2 ;;
+      -m|--merges)   INCLUDE_MERGES=true;  shift   ;;
+      -y|--yes)      SKIP_CONFIRM=true;    shift   ;;
+      --no-stats)    SHOW_STATS=false;     shift   ;;
+      -v|--version)  printf 'gitlogger v%s\n' "$VERSION"; exit 0 ;;
+      -h|--help)     usage; exit 0 ;;
+      # ── Legacy positional: gitlogger <email> [days] ──────────────────────
+      *)
+        if [[ "$1" == *@* && ${#AUTHORS[@]} -eq 0 ]]; then
+          AUTHORS+=("$1"); shift
+        elif [[ "$1" =~ ^[0-9]+$ ]]; then
+          DAYS="$1"; shift
+        else
+          printf 'Error: unknown option: %s\n\n' "$1" >&2
+          usage >&2; exit 1
+        fi ;;
+    esac
+  done
+}
 
-# Write the Python script to its own temp file — no heredoc nesting issues
-python3 -c "
-import sys
-script = open(sys.argv[1]).read()
-open(sys.argv[2], 'w').write(script)
-" /dev/stdin "$TMPPY" << 'PYEOF'
-import sys, csv
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from datetime import datetime
-from collections import OrderedDict
+# ── Validation ────────────────────────────────────────────────────────────────
+validate() {
+  [[ -d "$DIR" ]] || { printf 'Error: directory not found: %s\n' "$DIR" >&2; exit 1; }
+  cd -- "$DIR"
 
-OUTPUT_FILE   = sys.argv[1]
-REPO_NAME     = sys.argv[2]
-AUTHOR        = sys.argv[3]
-FIRST_DATE    = sys.argv[4]
-LAST_DATE     = sys.argv[5]
-DAYS          = sys.argv[6]
-TOTAL_COMMITS = int(sys.argv[7])
-MERGE_COUNT   = int(sys.argv[8])
-ACTIVE_DAYS   = int(sys.argv[9])
-CSV_FILE      = sys.argv[10]
+  git rev-parse --is-inside-work-tree &>/dev/null \
+    || { printf 'Error: not a git repository: %s\n' "$(pwd)" >&2; exit 1; }
 
-commits = []
-with open(CSV_FILE, newline='', encoding='utf-8') as f:
-    for row in csv.reader(f):
-        if len(row) >= 3:
-            commits.append({"date": row[0], "hash": row[1], "msg": row[2]})
+  # Fall back to git config user.email
+  if (( ${#AUTHORS[@]} == 0 )); then
+    local default_email
+    default_email=$(git config user.email 2>/dev/null || true)
+    [[ -n "$default_email" ]] \
+      || { printf 'Error: no --author given and git user.email is not set\n' >&2; exit 1; }
+    AUTHORS+=("$default_email")
+  fi
 
-DARK_BG   = "1E2A3A"
-MID_BG    = "2D3F52"
-ACCENT    = "4A9EFF"
-LIGHT_ROW = "F4F7FA"
-ALT_ROW   = "E8EFF7"
-WHITE     = "FFFFFF"
-BORDER_C  = "C8D6E5"
+  # Strict positive-integer check — avoids division-by-zero and bad git --since
+  [[ "$DAYS" =~ ^[1-9][0-9]*$ ]] \
+    || { printf 'Error: --days must be a positive integer, got: %s\n' "$DAYS" >&2; exit 1; }
 
-thin     = Side(style="thin", color=BORDER_C)
-full_bdr = Border(left=thin, right=thin, top=thin, bottom=thin)
+  case "$FORMAT"   in terminal|json|csv|md) ;; *)
+    printf 'Error: unknown --format: %s  (terminal|json|csv|md)\n' "$FORMAT" >&2; exit 1 ;; esac
+  case "$GROUP_BY" in day|type) ;; *)
+    printf 'Error: unknown --group-by: %s  (day|type)\n' "$GROUP_BY" >&2; exit 1 ;; esac
+}
 
-def fill(c):         return PatternFill("solid", fgColor=c)
-def center(w=False): return Alignment(horizontal="center", vertical="center", wrap_text=w)
-def left(w=True):    return Alignment(horizontal="left",   vertical="center", wrap_text=w)
+# ── Repository info banner ────────────────────────────────────────────────────
+repo_banner() {
+  local root name branch remote bcount author_str
+  root=$(git rev-parse --show-toplevel)
+  name=$(basename "$root")
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || printf 'unknown')
+  remote=$(git remote get-url origin 2>/dev/null || printf 'no remote')
+  bcount=$(git branch --all 2>/dev/null | wc -l | tr -d ' ')
+  author_str=$(IFS=', '; printf '%s' "${AUTHORS[*]}")
 
-wb = Workbook()
+  printf '\n'
+  printf '%s  ┌─────────────────────────────────────────────┐%s\n' "${B}${C}" "${Rs}"
+  printf '%s  │           Repository Detected                │%s\n' "${B}${C}" "${Rs}"
+  printf '%s  └─────────────────────────────────────────────┘%s\n' "${B}${C}" "${Rs}"
+  printf '  %sName      :%s %s%s%s\n'       "${Gy}" "${Rs}" "${B}" "$name"        "${Rs}"
+  printf '  %sPath      :%s %s\n'           "${Gy}" "${Rs}" "$root"
+  printf '  %sBranch    :%s %s\n'           "${Gy}" "${Rs}" "$branch"
+  printf '  %sRemote    :%s %s\n'           "${Gy}" "${Rs}" "$remote"
+  printf '  %sBranches  :%s %s\n'           "${Gy}" "${Rs}" "$bcount"
+  printf '  %sAuthor(s) :%s %s\n'           "${Gy}" "${Rs}" "$author_str"
+  printf '  %sPeriod    :%s last %s days\n' "${Gy}" "${Rs}" "$DAYS"
+  printf '\n'
+}
 
-# Sheet 1 — Timesheet
-ws = wb.active
-ws.title = "Timesheet"
-ws.sheet_view.showGridLines = False
-ws.freeze_panes = "A5"
+# ── Confirmation prompt ───────────────────────────────────────────────────────
+confirm_or_exit() {
+  $SKIP_CONFIRM && return 0
+  printf '  Analyse this repo? [y/N] '
+  local ans; read -r ans </dev/tty
+  case "$ans" in
+    [yY]*) printf '\n' ;;
+    *) printf '\n  %sAborted.%s\n\n' "${Y}" "${Rs}"; exit 0 ;;
+  esac
+}
 
-for col, w in [("A",14),("B",13),("C",11),("D",64)]:
-    ws.column_dimensions[col].width = w
+# ── Core: fetch + parse commits ───────────────────────────────────────────────
+# Internal record separator: \x01 (ASCII SOH) — won't appear in commit subjects
+# Output fields per line:  DATE \x01 HASH \x01 EMAIL \x01 TYPE \x01 SUBJECT
+#
+# Performance notes vs v1:
+#   v1: 6 subshells per commit (echo|grep x3 + clean_message with 5x sed)
+#   v2: single git log pipe into one awk process — O(1) subshells total
+#
+# Portability note:
+#   v1 used grep -oP (Perl regex — not available on macOS BSD grep)
+#   v2 uses awk ERE which is POSIX and works everywhere
+collect_commits() {
+  local author_args=() merge_flag=()
+  for e in "${AUTHORS[@]}"; do author_args+=(--author="$e"); done
+  $INCLUDE_MERGES || merge_flag=(--no-merges)
 
-ws.merge_cells("A1:D1")
-c = ws["A1"]
-c.value = f"Git Timesheet  ·  {REPO_NAME}"
-c.font  = Font(name="Arial", size=15, bold=True, color=WHITE)
-c.fill  = fill(DARK_BG); c.alignment = center()
-ws.row_dimensions[1].height = 34
+  # Single git log call; \x01 separator is safe across all field values
+  git log --all \
+    "${author_args[@]}" \
+    --since="${DAYS} days ago" \
+    --pretty=format:"%ad%x01%h%x01%ae%x01%s" \
+    --date=short \
+    "${merge_flag[@]}" \
+    2>/dev/null \
+  | awk 'BEGIN { FS="\001"; OFS="\001" }
+    {
+      date=$1; hash=$2; email=$3; s=$4
 
-ws.merge_cells("A2:D2")
-c = ws["A2"]
-c.value = f"Author: {AUTHOR}     Period: {FIRST_DATE}  \u2192  {LAST_DATE}   (last {DAYS} days)"
-c.font  = Font(name="Arial", size=9, color="A8C4E0")
-c.fill  = fill(DARK_BG); c.alignment = center()
-ws.row_dimensions[2].height = 18
+      # ── Extract conventional commit type ─────────────────────────────────
+      # Matches: feat:  fix(scope):  chore!:  etc.
+      type = "other"
+      if (match(s, /^[a-z]+(\([^)]*\))?!?[[:space:]]*:/)) {
+        prefix = substr(s, RSTART, RLENGTH)
+        sub(/(\([^)]*\))?!?[[:space:]]*:/, "", prefix)  # isolate type word
+        known = " feat fix chore docs style refactor test build ci perf revert "
+        if (index(known, " " prefix " ") > 0) type = prefix
+        # Strip the prefix from subject
+        sub(/^[a-z]+(\([^)]*\))?!?[[:space:]]*:[[:space:]]*/, "", s)
+      }
 
-stats = [
-    ("A3", str(TOTAL_COMMITS), "Commits"),
-    ("B3", str(ACTIVE_DAYS),   "Active Days"),
-    ("C3", str(MERGE_COUNT),   "Merges"),
-    ("D3", f"{TOTAL_COMMITS/ACTIVE_DAYS:.1f}" if ACTIVE_DAYS else "0", "Avg / Day"),
-]
-ws.row_dimensions[3].height = 38
-for ref, val, lbl in stats:
-    c = ws[ref]
-    c.value     = f"{val}\n{lbl}"
-    c.font      = Font(name="Arial", size=11, bold=True, color=WHITE)
-    c.fill      = fill(MID_BG)
-    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    c.border    = Border(bottom=Side(style="medium", color=ACCENT))
+      # ── Strip ticket / issue prefixes ─────────────────────────────────────
+      # [PROJ-123]  PROJ-123:  #42
+      sub(/^\[?[A-Z]+-[0-9]+\]?[[:space:]:\/\-]*/, "", s)
+      sub(/^#[0-9]+[[:space:]]*/, "", s)
 
-for col, hdr in enumerate(["Date","Weekday","Hash","Commit Message"], 1):
-    c = ws.cell(row=4, column=col, value=hdr)
-    c.font = Font(name="Arial", size=10, bold=True, color=WHITE)
-    c.fill = fill(ACCENT); c.alignment = center(); c.border = full_bdr
-ws.row_dimensions[4].height = 22
+      # ── Normalise whitespace ──────────────────────────────────────────────
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+      gsub(/[[:space:]]+/, " ", s)
 
-prev_date = None
-for i, commit in enumerate(commits):
-    r      = i + 5
-    is_new = commit["date"] != prev_date
-    try:
-        weekday = datetime.strptime(commit["date"], "%Y-%m-%d").strftime("%A")
-    except ValueError:
-        weekday = ""
-    row_fill = fill(LIGHT_ROW) if i % 2 == 0 else fill(ALT_ROW)
+      # ── Title-case first letter ───────────────────────────────────────────
+      if (length(s) > 0) s = toupper(substr(s,1,1)) substr(s,2)
 
-    c = ws.cell(row=r, column=1, value=commit["date"] if is_new else "")
-    c.font = Font(name="Arial", size=10, bold=is_new, color="1A252F" if is_new else "BBBBBB")
-    c.fill = row_fill; c.alignment = center(); c.border = full_bdr
+      print date, hash, email, type, s
+    }'
+}
 
-    c = ws.cell(row=r, column=2, value=weekday if is_new else "")
-    c.font = Font(name="Arial", size=10, color="5D6D7E")
-    c.fill = row_fill; c.alignment = center(); c.border = full_bdr
+# ── Merge count (stats only — separate query to keep main log clean) ──────────
+count_merges() {
+  local author_args=()
+  for e in "${AUTHORS[@]}"; do author_args+=(--author="$e"); done
+  git log --all "${author_args[@]}" --since="${DAYS} days ago" \
+    --merges --oneline 2>/dev/null | wc -l | tr -d ' '
+}
 
-    c = ws.cell(row=r, column=3, value=commit["hash"])
-    c.font = Font(name="Courier New", size=9, color="7F8C8D")
-    c.fill = row_fill; c.alignment = center(); c.border = full_bdr
+# ── Portable weekday name  (Linux: date -d;  macOS: date -jf) ─────────────────
+weekday_for() {  # $1 = YYYY-MM-DD
+  date -d "$1" +"%A" 2>/dev/null \
+  || date -jf "%Y-%m-%d" "$1" +"%A" 2>/dev/null \
+  || printf ''
+}
 
-    c = ws.cell(row=r, column=4, value=commit["msg"])
-    c.font = Font(name="Arial", size=10, color="2C3E50")
-    c.fill = row_fill; c.alignment = left(); c.border = full_bdr
+# ── Shared stats footer ───────────────────────────────────────────────────────
+print_stats() {
+  local data="$1"
+  local total active_days avg
+  total=$(awk 'END{print NR}' <<< "$data")
+  active_days=$(awk -F'\001' '{print $1}' <<< "$data" | sort -u | wc -l | tr -d ' ')
+  # Division-by-zero guard: should never be zero if data is non-empty, but be safe
+  if (( active_days > 0 )); then
+    avg=$(awk "BEGIN{ printf \"%.1f\", $total / $active_days }")
+  else
+    avg="0.0"
+  fi
+  printf '%s  ──────────────────────────────────────────────────────%s\n' "${B}${C}" "${Rs}"
+  printf '  %sTotal commits :%s %s%s%s\n'  "${Gy}" "${Rs}" "${B}" "$total"        "${Rs}"
+  printf '  %sActive days   :%s %s / %s\n' "${Gy}" "${Rs}" "$active_days"  "$DAYS"
+  printf '  %sAvg per day   :%s %s\n'      "${Gy}" "${Rs}" "$avg"
+  printf '\n'
+}
 
-    ws.row_dimensions[r].height = 18
-    prev_date = commit["date"]
+# ── Render: terminal — group by DAY ──────────────────────────────────────────
+render_terminal_day() {
+  local data="$1"
+  local total first_date last_date mc
+  total=$(awk 'END{print NR}' <<< "$data")
+  first_date=$(awk -F'\001' 'END{print $1}'  <<< "$data")
+  last_date=$(awk  -F'\001' 'NR==1{print $1}' <<< "$data")
+  mc=$(count_merges)
+  local multi=0; (( ${#AUTHORS[@]} > 1 )) && multi=1 || true
+  local repo_name; repo_name=$(basename "$(git rev-parse --show-toplevel)")
 
-# Sheet 2 — Summary
-ws2 = wb.create_sheet("Summary")
-ws2.sheet_view.showGridLines = False
+  printf '%s╔══════════════════════════════════════════════════════╗%s\n' "${B}${C}" "${Rs}"
+  printf '%s║              GIT TIMESHEET REPORT                   ║%s\n' "${B}${C}" "${Rs}"
+  printf '%s╚══════════════════════════════════════════════════════╝%s\n' "${B}${C}" "${Rs}"
+  printf '  %sRepo   :%s %s%s%s\n'   "${Gy}" "${Rs}" "${B}" "$repo_name" "${Rs}"
+  printf '  %sAuthor :%s %s\n'       "${Gy}" "${Rs}" "$(IFS=', '; printf '%s' "${AUTHORS[*]}")"
+  printf '  %sPeriod :%s %s → %s  (last %s days)\n' \
+    "${Gy}" "${Rs}" "$first_date" "$last_date" "$DAYS"
+  printf '  %sTotals :%s %s%s%s commits | %s merges\n\n' \
+    "${Gy}" "${Rs}" "${B}" "$total" "${Rs}" "$mc"
 
-for col, w in [("A",16),("B",14),("C",14)]:
-    ws2.column_dimensions[col].width = w
+  local cur_date="" day_count=0 wd
+  while IFS=$'\001' read -r date hash email type msg; do
+    if [[ "$date" != "$cur_date" ]]; then
+      [[ -n "$cur_date" ]] && printf '  %s└─ %d commit(s)%s\n\n' "${Gy}" "$day_count" "${Rs}"
+      wd=$(weekday_for "$date")
+      printf '%s  %s  %s%s\n' "${B}${Gr}" "$date" "$wd" "${Rs}"
+      printf '  %s──────────────────────────────────────%s\n' "${Gy}" "${Rs}"
+      cur_date="$date"; day_count=0
+    fi
+    day_count=$(( day_count + 1 ))
+    local tag=""
+    (( multi )) && tag=" ${Gy}[${email}]${Rs}"
+    printf '  %s•%s %s[%s]%s%s %s\n' "${Y}" "${Rs}" "${Gy}" "$hash" "${Rs}" "$tag" "$msg"
+  done <<< "$data"
+  [[ -n "$cur_date" ]] && printf '  %s└─ %d commit(s)%s\n\n' "${Gy}" "$day_count" "${Rs}"
 
-ws2.merge_cells("A1:C1")
-c = ws2["A1"]
-c.value = "Daily Commit Summary"
-c.font  = Font(name="Arial", size=13, bold=True, color=WHITE)
-c.fill  = fill(DARK_BG); c.alignment = center()
-ws2.row_dimensions[1].height = 30
+  $SHOW_STATS && print_stats "$data"
+}
 
-for col, hdr in enumerate(["Date","Weekday","Commits"], 1):
-    c = ws2.cell(row=2, column=col, value=hdr)
-    c.font = Font(name="Arial", size=10, bold=True, color=WHITE)
-    c.fill = fill(ACCENT); c.alignment = center(); c.border = full_bdr
-ws2.row_dimensions[2].height = 22
+# ── Render: terminal — group by COMMIT TYPE ───────────────────────────────────
+render_terminal_type() {
+  local data="$1"
+  local multi=0; (( ${#AUTHORS[@]} > 1 )) && multi=1 || true
+  local repo_name mc total
+  repo_name=$(basename "$(git rev-parse --show-toplevel)")
+  mc=$(count_merges)
+  total=$(awk 'END{print NR}' <<< "$data")
 
-day_counts = OrderedDict()
-for commit in commits:
-    d = commit["date"]
-    day_counts[d] = day_counts.get(d, 0) + 1
+  printf '%s╔══════════════════════════════════════════════════════╗%s\n' "${B}${C}" "${Rs}"
+  printf '%s║          GIT TIMESHEET REPORT  (by type)            ║%s\n' "${B}${C}" "${Rs}"
+  printf '%s╚══════════════════════════════════════════════════════╝%s\n' "${B}${C}" "${Rs}"
+  printf '  %sRepo   :%s %s%s%s\n'  "${Gy}" "${Rs}" "${B}" "$repo_name" "${Rs}"
+  printf '  %sAuthor :%s %s\n'      "${Gy}" "${Rs}" "$(IFS=', '; printf '%s' "${AUTHORS[*]}")"
+  printf '  %sTotals :%s %s%s%s commits | %s merges\n' \
+    "${Gy}" "${Rs}" "${B}" "$total" "${Rs}" "$mc"
 
-for i, (date_str, count) in enumerate(day_counts.items()):
-    r = i + 3
-    try:
-        weekday = datetime.strptime(date_str, "%Y-%m-%d").strftime("%A")
-    except ValueError:
-        weekday = ""
-    row_fill = fill(LIGHT_ROW) if i % 2 == 0 else fill(ALT_ROW)
-    for col, val in enumerate([date_str, weekday, count], 1):
-        c = ws2.cell(row=r, column=col, value=val)
-        c.font = Font(name="Arial", size=10, color="2C3E50")
-        c.fill = row_fill; c.alignment = center(); c.border = full_bdr
-    ws2.row_dimensions[r].height = 18
+  # Collect unique types in order of first appearance (no grep -P needed)
+  local types=()
+  while IFS= read -r t; do types+=("$t"); done \
+    < <(awk -F'\001' '{print $4}' <<< "$data" | awk '!seen[$0]++')
 
-tr = len(day_counts) + 3
-for col, val in enumerate(["TOTAL", f"{ACTIVE_DAYS} days", f"=SUM(C3:C{tr-1})"], 1):
-    c = ws2.cell(row=tr, column=col, value=val)
-    c.font = Font(name="Arial", size=10, bold=True, color="1A252F")
-    c.fill = fill("D5E8F0"); c.alignment = center(); c.border = full_bdr
-ws2.row_dimensions[tr].height = 22
+  for t in "${types[@]}"; do
+    local label="${TYPE_LABELS[$t]:-📌 Other}"
+    local count; count=$(awk -F'\001' -v tp="$t" '$4==tp{c++} END{print c+0}' <<< "$data")
+    printf '\n%s  %s%s  %s(%s)%s\n' "${B}${Y}" "$label" "${Rs}" "${Gy}" "$count" "${Rs}"
+    printf '  %s──────────────────────────────────────%s\n' "${Gy}" "${Rs}"
+    # Filter to just this type — one awk pass per type (max ~12 types)
+    while IFS=$'\001' read -r date hash email type msg; do
+      local tag=""
+      (( multi )) && tag=" ${Gy}[${email}]${Rs}"
+      printf '  %s•%s %s[%s]%s%s %s  %s(%s)%s\n' \
+        "${Y}" "${Rs}" "${Gy}" "$hash" "${Rs}" "$tag" "$msg" "${Gy}" "$date" "${Rs}"
+    done < <(awk -F'\001' -v tp="$t" '$4==tp' <<< "$data")
+  done
+  printf '\n'
 
-wb.save(OUTPUT_FILE)
-PYEOF
+  $SHOW_STATS && print_stats "$data"
+}
 
-if ! python3 -c "import openpyxl" 2>/dev/null; then
-  echo -e "${YELLOW}  openpyxl not found — installing...${RESET}"
-  pip3 install openpyxl --quiet 2>/dev/null || {
-    echo -e "${BOLD}✗ Error:${RESET} Could not install openpyxl. Run: pip install openpyxl"
-    exit 1
-  }
-fi
+# ── Render: JSON ──────────────────────────────────────────────────────────────
+render_json() {
+  local data="$1"
+  local repo_name first_date last_date total active_days avg
+  repo_name=$(basename "$(git rev-parse --show-toplevel)")
+  first_date=$(awk -F'\001' 'END{print $1}'   <<< "$data")
+  last_date=$(awk  -F'\001' 'NR==1{print $1}' <<< "$data")
+  total=$(awk 'END{print NR}' <<< "$data")
+  active_days=$(awk -F'\001' '{print $1}' <<< "$data" | sort -u | wc -l | tr -d ' ')
+  (( active_days > 0 )) \
+    && avg=$(awk "BEGIN{ printf \"%.1f\", $total / $active_days }") \
+    || avg="0.0"
 
-python3 "$TMPPY" \
-  "$OUTPUT_FILE" "$REPO_NAME" "$AUTHOR" "$FIRST_DATE" "$LAST_DATE" \
-  "$DAYS" "$TOTAL_COMMITS" "$MERGE_COUNT" "$ACTIVE_DAYS" "$TMPCSV"
+  # Build JSON authors array
+  local authors_json=""
+  for e in "${AUTHORS[@]}"; do authors_json+="\"${e}\","; done
+  authors_json="[${authors_json%,}]"
 
-echo ""
-echo -e "${BOLD}${GREEN}  ✓ Timesheet saved to:${RESET}"
-echo -e "    ${CYAN}${OUTPUT_FILE}${RESET}"
-echo ""
+  printf '{\n'
+  printf '  "repo": "%s",\n'         "$repo_name"
+  printf '  "authors": %s,\n'        "$authors_json"
+  printf '  "days": %s,\n'           "$DAYS"
+  printf '  "first_date": "%s",\n'   "$first_date"
+  printf '  "last_date": "%s",\n'    "$last_date"
+  printf '  "total_commits": %s,\n'  "$total"
+  printf '  "active_days": %s,\n'    "$active_days"
+  printf '  "avg_per_day": %s,\n'    "$avg"
+  printf '  "commits": [\n'
+
+  local first_entry=true
+  while IFS=$'\001' read -r date hash email type msg; do
+    $first_entry || printf ',\n'
+    first_entry=false
+    # Escape \ and " for valid JSON; commit subjects are single-line so no \n risk
+    local safe; safe=$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '    {"date":"%s","hash":"%s","author":"%s","type":"%s","subject":"%s"}' \
+      "$date" "$hash" "$email" "$type" "$safe"
+  done <<< "$data"
+
+  printf '\n  ]\n}\n'
+}
+
+# ── Render: CSV ───────────────────────────────────────────────────────────────
+render_csv() {
+  printf '"date","hash","author","type","subject"\n'
+  # All field splitting and quoting in a single awk pass
+  awk -F'\001' '{
+    gsub(/"/, "\"\"", $5)   # RFC 4180: double-up embedded quotes
+    printf "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n", $1, $2, $3, $4, $5
+  }' <<< "$1"
+}
+
+# ── Render: Markdown ──────────────────────────────────────────────────────────
+render_md() {
+  local data="$1"
+  local repo_name total active_days avg
+  repo_name=$(basename "$(git rev-parse --show-toplevel)")
+  total=$(awk 'END{print NR}' <<< "$data")
+  active_days=$(awk -F'\001' '{print $1}' <<< "$data" | sort -u | wc -l | tr -d ' ')
+  (( active_days > 0 )) \
+    && avg=$(awk "BEGIN{ printf \"%.1f\", $total / $active_days }") \
+    || avg="0.0"
+
+  printf '# Git Timesheet — %s\n\n' "$repo_name"
+  printf '**Author(s):** %s  \n'     "$(IFS=', '; printf '%s' "${AUTHORS[*]}")"
+  printf '**Period:** last %s days  \n' "$DAYS"
+  printf '**Commits:** %s | **Active days:** %s / %s | **Avg/day:** %s\n\n' \
+    "$total" "$active_days" "$DAYS" "$avg"
+  printf '---\n\n'
+
+  if [[ "$GROUP_BY" == "type" ]]; then
+    local types=()
+    while IFS= read -r t; do types+=("$t"); done \
+      < <(awk -F'\001' '{print $4}' <<< "$data" | awk '!seen[$0]++')
+    for t in "${types[@]}"; do
+      local label="${TYPE_LABELS[$t]:-Other}"
+      printf '## %s\n\n' "$label"
+      while IFS=$'\001' read -r date hash email type msg; do
+        printf -- '- `%s` **%s** *(by %s — %s)*\n' "$hash" "$msg" "$email" "$date"
+      done < <(awk -F'\001' -v tp="$t" '$4==tp' <<< "$data")
+      printf '\n'
+    done
+  else
+    local cur_date="" wd
+    while IFS=$'\001' read -r date hash email type msg; do
+      if [[ "$date" != "$cur_date" ]]; then
+        [[ -n "$cur_date" ]] && printf '\n'
+        wd=$(weekday_for "$date")
+        printf '## %s — %s\n\n' "$date" "$wd"
+        cur_date="$date"
+      fi
+      printf -- '- `%s` **%s** *(by %s — %s)*\n' "$hash" "$msg" "$email" "$type"
+    done <<< "$data"
+    printf '\n'
+  fi
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+main() {
+  parse_args "$@"
+  validate
+  init_colors
+
+  # Banner + confirmation only for interactive terminal output
+  if [[ "$FORMAT" == "terminal" ]]; then
+    repo_banner
+    confirm_or_exit
+  fi
+
+  local data
+  data=$(collect_commits)
+
+  if [[ -z "$data" ]]; then
+    local who; who=$(IFS=', '; printf '%s' "${AUTHORS[*]}")
+    printf '%sNo commits found for [%s] in the last %s days.%s\n' \
+      "${Y}" "$who" "$DAYS" "${Rs}"
+    exit 0
+  fi
+
+  case "$FORMAT" in
+    terminal)
+      case "$GROUP_BY" in
+        day)  render_terminal_day  "$data" ;;
+        type) render_terminal_type "$data" ;;
+      esac ;;
+    json) render_json "$data" ;;
+    csv)  render_csv  "$data" ;;
+    md)   render_md   "$data" ;;
+  esac
+}
+
+main "$@"
