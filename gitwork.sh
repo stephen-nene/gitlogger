@@ -97,10 +97,11 @@ fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage ;;
-    --since) SINCE="$2"; shift 2 ;;
-    --until) UNTIL="$2"; shift 2 ;;
+    --since) [[ $# -lt 2 ]] && { echo "❌ --since requires a value" >&2; exit 1; }; SINCE="$2"; shift 2 ;;
+    --until) [[ $# -lt 2 ]] && { echo "❌ --until requires a value" >&2; exit 1; }; UNTIL="$2"; shift 2 ;;
 
     --authors)
+      [[ $# -lt 2 ]] && { echo "❌ --authors requires a value" >&2; exit 1; }
       EXPLICIT_AUTHOR=true
       if [[ -n "$AUTHORS_STRING" ]]; then
         AUTHORS_STRING+=",$2"
@@ -134,15 +135,19 @@ while [[ $# -gt 0 ]]; do
     --only-merges) MERGES="--merges"; shift ;;
     --include-merges) MERGES=""; shift ;;
     --path)
+      [[ $# -lt 2 ]] && { echo "❌ --path requires a value" >&2; exit 1; }
       if [[ "$2" == /* ]]; then
         REPO_DIR="$2"
       else
         REPO_DIR="$(pwd)/$2"
       fi
       shift 2 ;;
-    --file-path) PATH_SCOPE="$2"; shift 2 ;;
+    --file-path)
+      [[ $# -lt 2 ]] && { echo "❌ --file-path requires a value" >&2; exit 1; }
+      PATH_SCOPE="$2"; shift 2 ;;
 
     --grep)
+      [[ $# -lt 2 ]] && { echo "❌ --grep requires a value" >&2; exit 1; }
       GREP_PATTERNS+=("$2")
       shift 2 ;;
 
@@ -207,7 +212,7 @@ display_repo_info_and_confirm() {
 
   if ! $SKIP_CONFIRM; then
     printf "  ${BOLD}Analyse this repo? [y/N] ${RESET}"
-    read -r response
+    read -r response </dev/tty
     echo
     if [[ ! "$response" =~ ^[Yy]$ ]]; then
       printf "  ${DIM}Exiting without analysis.${RESET}\n"
