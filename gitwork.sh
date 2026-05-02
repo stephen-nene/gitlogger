@@ -92,6 +92,7 @@ if [[ $# -gt 0 ]]; then
     *)          ;;
   esac
 fi
+[[ -z "$SINCE" ]] && SINCE="20 days ago"
 
 # ─── Parse flags ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -176,14 +177,7 @@ display_repo_info_and_confirm() {
   remote=$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || echo "none")
   branch_count=$(git -C "$REPO_DIR" branch --all 2>/dev/null | wc -l | xargs)
 
-  # Format period text
-  if [[ -n "$SINCE" ]]; then
-    period_text="$SINCE"
-  elif [[ "$1" =~ ^[0-9]+$ ]]; then
-    period_text="last $1 days"
-  else
-    period_text="all time"
-  fi
+  period_text="$SINCE"
 
   # Format authors display
   local authors_display=""
@@ -208,6 +202,10 @@ display_repo_info_and_confirm() {
   printf "  ${GRAY}Branches${RESET}  : ${GREEN}%s${RESET}\n" "$branch_count"
   printf "  ${GRAY}Author(s)${RESET} : ${GREEN}%s${RESET}\n" "$authors_display"
   printf "  ${GRAY}Period${RESET}    : ${YELLOW}%s${RESET}\n" "$period_text"
+  printf "  ${GRAY}Command${RESET}   : ${DIM}git log --since=\"%s\" %s%s${RESET}\n" \
+    "$SINCE" \
+    "$(if [[ -n "$AUTHORS_STRING" ]]; then echo "--author=... "; fi)" \
+    "$(case "$MODE" in oneline) echo "--oneline";; stat) echo "--stat";; diff) echo "-p";; files) echo "--name-only";; *) echo "";; esac)"
   printf "\n"
 
   if ! $SKIP_CONFIRM; then
