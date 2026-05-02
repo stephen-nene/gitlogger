@@ -1,18 +1,12 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# gitlogger v2.0  —  multi-author, multi-format git timesheet
+# gitlogger v2.1  —  multi-author, multi-format git timesheet
 #
-# IMPROVEMENTS over v1:
-#   --dir         target any repo path, not just cwd
-#   --author      repeat flag for multiple emails; shows per-author tags
-#   --format      terminal | json | csv | md
-#   --group-by    day | type  (conventional commit grouping)
-#   --merges      opt-in to include merge commits
-#   Portability   no grep -P (not on macOS), works on Linux + macOS
-#   Performance   single git log call; awk-based message parsing
-#                 replaces 6 subshells-per-commit with one awk stream
-#   Safety        division-by-zero guard; positive-int day validation
-#   Modular       each concern is its own function
+# UPDATES in v2.1:
+#   --author      accepts comma-separated emails: -a "a@b.com,c@d.com"
+#   Email regex   validates email format before processing
+#   Full messages  includes commit body (bullet points, multi-line messages)
+#   JSON escaping  properly handles newlines and quotes in full messages
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -23,7 +17,7 @@ if (( BASH_VERSINFO[0] < 4 )); then
   exit 1
 fi
 
-readonly VERSION="2.0.0"
+readonly VERSION="2.1.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 AUTHORS=()
@@ -53,6 +47,13 @@ declare -A TYPE_LABELS=(
   [revert]="⏪ Reverts"        [other]="📌 Other"
 )
 
+# ── Email validation ──────────────────────────────────────────────────────────
+validate_email() {
+  local email="$1"
+  # RFC 5322 compliant-ish pattern
+  [[ "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]
+}
+
 # ── Usage ─────────────────────────────────────────────────────────────────────
 usage() {
   cat <<EOF
@@ -60,7 +61,7 @@ gitlogger v${VERSION} — git commit timesheet
 
 Usage: gitlogger [OPTIONS]
 
-  -a, --author <email>    Author email (repeat for multiple authors)
+  -a, --author <email>    Author email(s) - repeat flag or comma-separated
   -d, --dir <path>        Repo path (default: current directory)
   -n, --days <N>          Days to look back (default: 15)
   -f, --format <fmt>      terminal | json | csv | md  (default: terminal)
@@ -73,8 +74,8 @@ Usage: gitlogger [OPTIONS]
 
 Examples:
   gitlogger -a me@example.com -n 7
-  gitlogger -a alice@co.com -a bob@co.com -n 30 --format md > sprint.md
-  gitlogger -d ~/projects/api --group-by type
+  gitlogger -a "alice@co.com,bob@co.com" -n 30 --format md > sprint.md
+  gitlogger -a alice@co.com -a bob@co.com -d ~/projects/api --group-by type
   gitlogger --format json | jq '.commits | length'
   gitlogger --format csv | sort -t, -k1
 EOF
@@ -84,7 +85,15 @@ EOF
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      -a|--author)   AUTHORS+=("$2");      shift 2 ;;
+      -a|--author)
+        # Handle comma-separated emails
+        IFS=',' read -ra emails <<< "$2"
+        for e in "${emails[@]}"; do
+          # Trim whitespace
+          e_trimmed="$(echo "$e" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          [[ -n "$e_trimmed" ]] && AUTHORS+=("$e_trimmed")
+        done
+        shift 2 ;;
       -d|--dir)      DIR="$2";             shift 2 ;;
       -n|--days)     DAYS="$2";            shift 2 ;;
       -f|--format)   FORMAT="$2";          shift 2 ;;
@@ -124,6 +133,14 @@ validate() {
       || { printf 'Error: no --author given and git user.email is not set\n' >&2; exit 1; }
     AUTHORS+=("$default_email")
   fi
+
+  # Validate all email formats
+  for email in "${AUTHORS[@]}"; do
+    if ! validate_email "$email"; then
+      printf 'Error: invalid email format: %s\n' "$email" >&2
+      exit 1
+    fi
+  done
 
   # Strict positive-integer check — avoids division-by-zero and bad git --since
   [[ "$DAYS" =~ ^[1-9][0-9]*$ ]] \
@@ -172,31 +189,32 @@ confirm_or_exit() {
 
 # ── Core: fetch + parse commits ───────────────────────────────────────────────
 # Internal record separator: \x01 (ASCII SOH) — won't appear in commit subjects
-# Output fields per line:  DATE \x01 HASH \x01 EMAIL \x01 TYPE \x01 SUBJECT
+# Output fields per line:  DATE \x01 HASH \x01 EMAIL \x01 TYPE \x01 FULL_MESSAGE
 #
-# Performance notes vs v1:
-#   v1: 6 subshells per commit (echo|grep x3 + clean_message with 5x sed)
-#   v2: single git log pipe into one awk process — O(1) subshells total
-#
-# Portability note:
-#   v1 used grep -oP (Perl regex — not available on macOS BSD grep)
-#   v2 uses awk ERE which is POSIX and works everywhere
+# FULL_MESSAGE format: subject + "\n" + body (if body exists)
 collect_commits() {
   local author_args=() merge_flag=()
   for e in "${AUTHORS[@]}"; do author_args+=(--author="$e"); done
   $INCLUDE_MERGES || merge_flag=(--no-merges)
 
-  # Single git log call; \x01 separator is safe across all field values
+  # Single git log call; %B gives full message (subject + body)
+  # We use %s for subject and %b for body to process them separately
   git log --all \
     "${author_args[@]}" \
     --since="${DAYS} days ago" \
-    --pretty=format:"%ad%x01%h%x01%ae%x01%s" \
+    --pretty=format:"%ad%x01%h%x01%ae%x01%s%x01%b" \
     --date=short \
     "${merge_flag[@]}" \
     2>/dev/null \
   | awk 'BEGIN { FS="\001"; OFS="\001" }
     {
-      date=$1; hash=$2; email=$3; s=$4
+      date=$1; hash=$2; email=$3; subject=$4; body=$5
+
+      # Combine subject and body
+      s = subject
+      if (length(body) > 0) {
+        s = s "\n" body
+      }
 
       # ── Extract conventional commit type ─────────────────────────────────
       # Matches: feat:  fix(scope):  chore!:  etc.
@@ -215,12 +233,23 @@ collect_commits() {
       sub(/^\[?[A-Z]+-[0-9]+\]?[[:space:]:\/\-]*/, "", s)
       sub(/^#[0-9]+[[:space:]]*/, "", s)
 
-      # ── Normalise whitespace ──────────────────────────────────────────────
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+      # ── Normalise whitespace (preserve newlines) ──────────────────────────
+      # Only clean up leading/trailing whitespace, keep internal newlines
+      sub(/^[[:space:]\n]+/, "", s)
+      sub(/[[:space:]\n]+$/, "", s)
+
+      # Collapse multiple spaces but preserve newlines
       gsub(/[[:space:]]+/, " ", s)
+      gsub(/\n[[:space:]]+/, "\n", s)
+      gsub(/[[:space:]]+\n/, "\n", s)
 
       # ── Title-case first letter ───────────────────────────────────────────
-      if (length(s) > 0) s = toupper(substr(s,1,1)) substr(s,2)
+      if (length(s) > 0) {
+        first_char = substr(s, 1, 1)
+        if (first_char ~ /[a-z]/) {
+          s = toupper(first_char) substr(s, 2)
+        }
+      }
 
       print date, hash, email, type, s
     }'
@@ -239,6 +268,20 @@ weekday_for() {  # $1 = YYYY-MM-DD
   date -d "$1" +"%A" 2>/dev/null \
   || date -jf "%Y-%m-%d" "$1" +"%A" 2>/dev/null \
   || printf ''
+}
+
+# ── Format message for display (handle multi-line) ────────────────────────────
+format_message_display() {
+  local msg="$1"
+  local first_line=true
+  while IFS= read -r line; do
+    if $first_line; then
+      printf '%s' "$line"
+      first_line=false
+    else
+      printf '\n                      %s' "$line"
+    fi
+  done <<< "$msg"
 }
 
 # ── Shared stats footer ───────────────────────────────────────────────────────
@@ -293,7 +336,18 @@ render_terminal_day() {
     day_count=$(( day_count + 1 ))
     local tag=""
     (( multi )) && tag=" ${Gy}[${email}]${Rs}"
-    printf '  %s•%s %s[%s]%s%s %s\n' "${Y}" "${Rs}" "${Gy}" "$hash" "${Rs}" "$tag" "$msg"
+
+    # Display message with proper indentation for multi-line
+    printf '  %s•%s %s[%s]%s%s ' "${Y}" "${Rs}" "${Gy}" "$hash" "${Rs}" "$tag"
+    local first_line=true
+    while IFS= read -r line; do
+      if $first_line; then
+        printf '%s\n' "$line"
+        first_line=false
+      else
+        printf '                      %s\n' "$line"
+      fi
+    done <<< "$msg"
   done <<< "$data"
   [[ -n "$cur_date" ]] && printf '  %s└─ %d commit(s)%s\n\n' "${Gy}" "$day_count" "${Rs}"
 
@@ -317,7 +371,7 @@ render_terminal_type() {
   printf '  %sTotals :%s %s%s%s commits | %s merges\n' \
     "${Gy}" "${Rs}" "${B}" "$total" "${Rs}" "$mc"
 
-  # Collect unique types in order of first appearance (no grep -P needed)
+  # Collect unique types in order of first appearance
   local types=()
   while IFS= read -r t; do types+=("$t"); done \
     < <(awk -F'\001' '{print $4}' <<< "$data" | awk '!seen[$0]++')
@@ -327,12 +381,20 @@ render_terminal_type() {
     local count; count=$(awk -F'\001' -v tp="$t" '$4==tp{c++} END{print c+0}' <<< "$data")
     printf '\n%s  %s%s  %s(%s)%s\n' "${B}${Y}" "$label" "${Rs}" "${Gy}" "$count" "${Rs}"
     printf '  %s──────────────────────────────────────%s\n' "${Gy}" "${Rs}"
-    # Filter to just this type — one awk pass per type (max ~12 types)
+    # Filter to just this type
     while IFS=$'\001' read -r date hash email type msg; do
       local tag=""
       (( multi )) && tag=" ${Gy}[${email}]${Rs}"
-      printf '  %s•%s %s[%s]%s%s %s  %s(%s)%s\n' \
-        "${Y}" "${Rs}" "${Gy}" "$hash" "${Rs}" "$tag" "$msg" "${Gy}" "$date" "${Rs}"
+      printf '  %s•%s %s[%s]%s%s ' "${Y}" "${Rs}" "${Gy}" "$hash" "${Rs}" "$tag"
+      local first_line=true
+      while IFS= read -r line; do
+        if $first_line; then
+          printf '%s  %s(%s)%s\n' "$line" "${Gy}" "$date" "${Rs}"
+          first_line=false
+        else
+          printf '                      %s\n' "$line"
+        fi
+      done <<< "$msg"
     done < <(awk -F'\001' -v tp="$t" '$4==tp' <<< "$data")
   done
   printf '\n'
@@ -373,8 +435,9 @@ render_json() {
   while IFS=$'\001' read -r date hash email type msg; do
     $first_entry || printf ',\n'
     first_entry=false
-    # Escape \ and " for valid JSON; commit subjects are single-line so no \n risk
-    local safe; safe=$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    # Proper JSON escaping: backslash, quotes, and newlines
+    local safe
+    safe=$(printf '%s' "$msg" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk '{printf "%s\\n", $0}' | sed 's/\\n$//')
     printf '    {"date":"%s","hash":"%s","author":"%s","type":"%s","subject":"%s"}' \
       "$date" "$hash" "$email" "$type" "$safe"
   done <<< "$data"
@@ -385,9 +448,11 @@ render_json() {
 # ── Render: CSV ───────────────────────────────────────────────────────────────
 render_csv() {
   printf '"date","hash","author","type","subject"\n'
-  # All field splitting and quoting in a single awk pass
+  # Handle multi-line messages by replacing newlines with spaces for CSV
   awk -F'\001' '{
     gsub(/"/, "\"\"", $5)   # RFC 4180: double-up embedded quotes
+    gsub(/\n/, " ", $5)     # Replace newlines with spaces for CSV
+    gsub(/[[:space:]]+/, " ", $5)  # Normalize spaces
     printf "\"%s\",\"%s\",\"%s\",\"%s\",\"%s\"\n", $1, $2, $3, $4, $5
   }' <<< "$1"
 }
@@ -418,7 +483,9 @@ render_md() {
       local label="${TYPE_LABELS[$t]:-Other}"
       printf '## %s\n\n' "$label"
       while IFS=$'\001' read -r date hash email type msg; do
-        printf -- '- `%s` **%s** *(by %s — %s)*\n' "$hash" "$msg" "$email" "$date"
+        # Replace newlines with <br> for markdown
+        local md_msg; md_msg=$(printf '%s' "$msg" | sed 's/$/<br>/' | tr -d '\n' | sed 's/<br>$//')
+        printf -- '- `%s` **%s** *(by %s — %s)*\n' "$hash" "$md_msg" "$email" "$date"
       done < <(awk -F'\001' -v tp="$t" '$4==tp' <<< "$data")
       printf '\n'
     done
@@ -431,7 +498,9 @@ render_md() {
         printf '## %s — %s\n\n' "$date" "$wd"
         cur_date="$date"
       fi
-      printf -- '- `%s` **%s** *(by %s — %s)*\n' "$hash" "$msg" "$email" "$type"
+      # Replace newlines with <br> for markdown
+      local md_msg; md_msg=$(printf '%s' "$msg" | sed 's/$/<br>/' | tr -d '\n' | sed 's/<br>$//')
+      printf -- '- `%s` **%s** *(by %s — %s)*\n' "$hash" "$md_msg" "$email" "$type"
     done <<< "$data"
     printf '\n'
   fi
