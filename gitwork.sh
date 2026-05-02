@@ -304,7 +304,8 @@ case "$MODE" in
         date = $1; hash = $2; subject = $3; body = $4
         if (date != prev_date) {
           if (prev_date != "") print ""
-          printf "\n📅 \033[1;36m%s\033[0m\n", date
+          printf "\n \033[1;36m%s\033[0m\n", date
+          # printf "\n📅 \033[1;36m%s\033[0m\n", date
           prev_date = date
         }
         printf "  • \033[1;33m%s\033[0m %s", hash, subject
