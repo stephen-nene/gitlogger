@@ -210,7 +210,7 @@ display_repo_info_and_confirm() {
     read -r response
     echo
     if [[ ! "$response" =~ ^[Yy]$ ]]; then
-      echo "  ${DIM}Exiting without analysis.${RESET}"
+      printf "  ${DIM}Exiting without analysis.${RESET}\n"
       exit 0
     fi
   fi
